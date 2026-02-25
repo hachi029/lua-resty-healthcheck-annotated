@@ -320,6 +320,8 @@ do
   -- @param ... arguments that will be passed to fn
   -- @return The results of the function; or nil and an error message
   -- in case it fails locking.
+  --- 这个方法加锁key后，执行fn, 加锁等待超时时间为LOCK_TIMEOUT=5s
+  --- 在不能阻塞的上下文执行，如果加锁失败，会放到timer里异步执行
   function run_locked(self, key, fn, ...)
     -- we're extra extra extra defensive in this code path
     local typ = type(key)
@@ -429,6 +431,14 @@ local function get_target(self, ip, port, hostname)
   return ((self.targets[ip] or EMPTY)[port] or EMPTY)[hostname]
 end
 
+
+---添加一个target, 具体操作
+---1.对共享内存中target_list加锁，遍历target_list每个target,查看target是否已经存在，如果已存在直接返回
+---2.如果已存在但purge_time不为nil，则清除purge_time
+---3.如果不存在：
+---   3.1 设置target的状态到共享内存，is_healthy 默认为true
+---   3.2 添加到target_list中，并更新共享内存中的target_list
+---   3.3 触发events.is_healthy事件
 --- Add a target to the healthchecker.
 -- When the ip + port + hostname combination already exists, it will simply
 -- return success (without updating `is_healthy` status).
@@ -512,7 +522,7 @@ function checker:add_target(ip, port, hostname, is_healthy, hostheader)
 
 end
 
-
+--- 清理target在共享内存中的状态数据，包括TARGET_STATE和TARGET_COUNTER
 -- Remove health status entries from an individual target from shm
 -- @param self The checker object
 -- @param ip IP address of the target being checked.
@@ -529,7 +539,11 @@ local function clear_target_data_from_shm(self, ip, port, hostname)
     end
 end
 
-
+-----移除一个target，包括
+-----1.从targets中移除并更新到共享内存中
+-----2.清理target的计数和状态
+-----3.触发event.remove事件
+---注意，这个方法里并没有更新self.targets，而是在event_handler中处理
 --- Remove a target from the healthchecker.
 -- The target not existing is not considered an error.
 -- @param ip IP address of the target being checked.
@@ -576,7 +590,10 @@ function checker:remove_target(ip, port, hostname)
   end)
 end
 
-
+--- 立即清除checker，包括
+---1.清除targets为{}并更新到共享内存中
+---2.清理各个target的计数和状态
+---3.触发event.clear事件
 --- Clear all healthcheck data.
 -- @return `true` on success, or `nil + error` on failure.
 function checker:clear()
@@ -608,7 +625,7 @@ function checker:clear()
   end)
 end
 
-
+--- 设置了target上的purge_time = ngx_now() + delay, 并将targets更新到共享内存里
 --- Clear all healthcheck data after a period of time.
 -- Useful for keeping target status between configuration reloads.
 -- @param delay delay in seconds before purging target state.
@@ -634,7 +651,7 @@ function checker:delayed_clear(delay)
   end)
 end
 
-
+-- 只是获取的本地的状态
 --- Get the current status of the target.
 -- @param ip IP address of the target being checked.
 -- @param port the port being checked against.
@@ -709,7 +726,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
   end
 
   port = tonumber(port)
-  local target = get_target(self, ip, port, hostname)
+  local target = get_target(self, ip, port, hostname) --只是从本地self.targets中查询到的
   if not target then
     -- sync issue: warn, but return success
     self:log(WARN, "trying to increment a target that is not in the list: ",
@@ -718,12 +735,13 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
   end
 
   local current_health = target.internal_health
-  if health_report == current_health then
+  if health_report == current_health then     --如果当前状态和要增加计数的状态一致，则忽略。
     -- No need to count successes when internal health is fully "healthy"
     -- or failures when internal health is fully "unhealthy"
     return true
   end
 
+  -- 获取进程间的此target锁后进行操作
   return locking_target(self, ip, port, hostname, function()
     local counter_key = key_for(self.TARGET_COUNTER, ip, port, hostname)
     local multictr, err = self.shm:incr(counter_key, ctr_type, 0)
@@ -738,7 +756,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
                    "(", ip, ":", port, ")'")
 
     local new_multictr
-    if ctr_type == CTR_SUCCESS then
+    if ctr_type == CTR_SUCCESS then   --计数最大255
       new_multictr = bit.band(multictr, MASK_SUCCESS)
     else
       new_multictr = bit.band(multictr, MASK_FAILURE)
@@ -749,7 +767,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     end
 
     local new_health
-    if ctr >= limit then
+    if ctr >= limit then      --计数超过限制，发生状态改变
       new_health = health_report
     elseif current_health == "healthy" and bit.band(new_multictr, MASK_FAILURE) > 0 then
       new_health = "mostly_healthy"
@@ -760,7 +778,7 @@ local function incr_counter(self, health_report, ip, port, hostname, limit, ctr_
     if new_health and new_health ~= current_health then
       local state_key = key_for(self.TARGET_STATE, ip, port, hostname)
       self.shm:set(state_key, INTERNAL_STATES[new_health])
-      self:raise_event(self.events[new_health], ip, port, hostname)
+      self:raise_event(self.events[new_health], ip, port, hostname)   --触发事件
     end
 
     return true
@@ -837,6 +855,7 @@ function checker:report_http_status(ip, port, hostname, http_status, check)
 
   local checks = self.checks[check or "passive"]
 
+  -- 根据配置决定status_type,是healthy还是unhealthy.如果没有找到,则忽略
   local status_type, limit, ctr
   if checks.healthy.http_statuses[http_status] then
     status_type = "healthy"
@@ -894,7 +913,7 @@ function checker:report_timeout(ip, port, hostname, check)
 
 end
 
-
+--- force 设置所有target健康状态
 --- Sets the current status of all targets with the given hostname and port.
 -- @param hostname hostname being checked.
 -- @param port the port being checked against
@@ -920,7 +939,7 @@ function checker:set_all_target_statuses_for_hostname(hostname, port, is_healthy
   return all_ok, #errs > 0 and table_concat(errs, "; ") or nil
 end
 
-
+--- 由外部调用的设置target状态
 --- Sets the current status of the target.
 -- This will immediately set the status and clear its counters.
 -- @param ip IP address of the target being checked
@@ -935,7 +954,7 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
 
   local health_report = is_healthy and "healthy" or "unhealthy"
 
-  local target = get_target(self, ip, port, hostname)
+  local target = get_target(self, ip, port, hostname)   --只是从本地self.targets中查询到的
   if not target then
     -- sync issue: warn, but return success
     self:log(WARN, "trying to set status for a target that is not in the list: ", ip, ":", port)
@@ -947,17 +966,17 @@ function checker:set_target_status(ip, port, hostname, is_healthy)
 
   local ok, err = locking_target(self, ip, port, hostname, function()
 
-    local _, err = self.shm:set(counter_key, 0)
+    local _, err = self.shm:set(counter_key, 0)   --counter_key初始化为0
     if err then
       return nil, err
     end
 
-    self.shm:set(state_key, INTERNAL_STATES[health_report])
+    self.shm:set(state_key, INTERNAL_STATES[health_report])   --共享内存里设置的状态是数字而不是字符串
     if err then
       return nil, err
     end
 
-    self:raise_event(self.events[health_report], ip, port, hostname)
+    self:raise_event(self.events[health_report], ip, port, hostname)  --发送事件
 
     return true
 
@@ -986,6 +1005,7 @@ end
 
 
 -- Runs a single healthcheck probe
+-- 执行针对单个ip:port的主动健康检查
 function checker:run_single_check(ip, port, hostname, hostheader)
 
   local sock, err = ngx.socket.tcp()
@@ -1006,23 +1026,23 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     return self:report_tcp_failure(ip, port, hostname, "connect", "active")
   end
 
-  if self.checks.active.type == "tcp" then
+  if self.checks.active.type == "tcp" then    --如果只是执行tcp检查，到这里就结束了
     sock:close()
     return self:report_success(ip, port, hostname, "active")
   end
 
-  if self.checks.active.type == "https" then
+  if self.checks.active.type == "https" then  --如果是https,进行ssl握手
     local https_sni, session, err
     https_sni = self.checks.active.https_sni or hostheader or hostname
     if self.ssl_cert and self.ssl_key then
-      ok, err = sock:setclientcert(self.ssl_cert, self.ssl_key)
+      ok, err = sock:setclientcert(self.ssl_cert, self.ssl_key) --设置客户端证书
 
       if not ok then
         self:log(ERR, "failed to set client certificate: ", err)
       end
     end
 
-    session, err = sock:sslhandshake(nil, https_sni,
+    session, err = sock:sslhandshake(nil, https_sni,  --ssl握手
                                      self.checks.active.https_verify_certificate)
 
     if not session then
@@ -1033,6 +1053,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
 
   end
 
+  -- 生成最终的header string
   local req_headers = self.checks.active.headers
   local headers
   if self.checks.active._headers_str then
@@ -1071,12 +1092,12 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   self:log(DEBUG, "request head: ", request)
 
   local bytes
-  bytes, err = sock:send(request)
+  bytes, err = sock:send(request) --发送http请求
   if not bytes then
     self:log(ERR, "failed to send http request to '", hostname, " (", ip, ":", port, ")': ", err)
     if err == "timeout" then
       sock:close()  -- timeout errors do not close the socket.
-      return self:report_timeout(ip, port, hostname, "active")
+      return self:report_timeout(ip, port, hostname, "active")  --write超时
     end
     return self:report_tcp_failure(ip, port, hostname, "send", "active")
   end
@@ -1087,7 +1108,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
     self:log(ERR, "failed to receive status line from '", hostname, " (",ip, ":", port, ")': ", err)
     if err == "timeout" then
       sock:close()  -- timeout errors do not close the socket.
-      return self:report_timeout(ip, port, hostname, "active")
+      return self:report_timeout(ip, port, hostname, "active")    --read 超时
     end
     return self:report_tcp_failure(ip, port, hostname, "receive", "active")
   end
@@ -1095,7 +1116,7 @@ function checker:run_single_check(ip, port, hostname, hostheader)
   local from, to = re_find(status_line,
                           [[^HTTP/\d+\.\d+\s+(\d+)]],
                           "joi", nil, 1)
-  local status
+  local status    --解析status
   if from then
     status = tonumber(status_line:sub(from, to))
   else
@@ -1124,10 +1145,12 @@ end
 
 -- runs the active healthchecks concurrently, in multiple work packages.
 -- @param list the list of targets to check
+--执行主动健康检查，将list根据concurrency分成小包,启动多个协程执行
 function checker:active_check_targets(list)
   local idx = 1
   local work_packages = {}
 
+  --分成self.checks.active.concurrency个小包
   for _, work_item in ipairs(list) do
     local package = work_packages[idx]
     if not package then
@@ -1141,6 +1164,7 @@ function checker:active_check_targets(list)
 
   -- hand out work-packages to the threads, note the "-1" because this timer
   -- thread will handle the last package itself.
+  -- 每个work_package启动一个协程执行
   local threads = {}
   for i = 1, #work_packages - 1 do
     threads[i] = ngx.thread.spawn(self.run_work_package, self, work_packages[i])
@@ -1164,12 +1188,14 @@ end
 
 -- @return `true` on success, or false if the lock was not acquired, or `nil + error`
 -- in case of errors
+-- 获取worker间锁，锁定时间LOCK_PERIOD=1.5s
 local function get_periodic_lock(shm, key)
   local my_pid = ngx_worker_pid()
   local checker_pid = shm:get(key)
 
   if checker_pid == nil then
     -- no worker is checking, try to acquire the lock
+    -- CHECK_INTERVAL * 15 = 1.5s
     local ok, err = shm:add(key, my_pid, LOCK_PERIOD)
     if not ok then
       if err == "exists" then
@@ -1189,6 +1215,7 @@ end
 
 
 -- touch the shm to refresh the valid period
+-- 重设锁定时间
 local function renew_periodic_lock(shm, key)
   local my_pid = ngx_worker_pid()
 
@@ -1198,7 +1225,7 @@ local function renew_periodic_lock(shm, key)
   end
 end
 
-
+--- 当执行hc实例的健康检查时，调用此方法获取锁。
 local function get_callback_lock(shm, key, ttl)
   local value = shm:get(key)
   if value == nil then
@@ -1228,6 +1255,7 @@ end
 --- Active health check callback function.
 -- @param self the checker object this timer runs on
 -- @param health_mode either "healthy" or "unhealthy" to indicate what check
+--- 执行主动健康检查。health_mode为 "healthy" or "unhealthy"
 local function checker_callback(self, health_mode)
   if self.checker_callback_count then
     self.checker_callback_count = self.checker_callback_count + 1
@@ -1236,6 +1264,7 @@ local function checker_callback(self, health_mode)
   -- Set a callback pending lock will exist for 2x the time of the active check.
   -- An active check should be finished within this time and next timer will be
   -- executed to exit a pending status.
+  -- 执行healthy和unhealthy interval 最大时间间隔
   local callback_pending_ttl = (math_max(self.checks.active.healthy.active and
                                          self.checks.active.healthy.interval or 0,
                                          self.checks.active.unhealthy.active and
@@ -1244,22 +1273,26 @@ local function checker_callback(self, health_mode)
 
   local callback_lock = self.CALLBACK_LOCK .. health_mode
   -- a pending timer already exists, so skip this time
+  -- 尝试获取callback_lock，如果获取失败，直接返回
   local ok, _ = get_callback_lock(self.shm, callback_lock, callback_pending_ttl)
   if not ok then
     return
   end
 
   local list_to_check = {}
-  local targets, err = fetch_target_list(self)
+  local targets, err = fetch_target_list(self)    --从共享内存拉取到的所有的target
   if not targets then
     self:log(ERR, "checker_callback: ", err)
-    remove_callback_lock(self.shm, callback_lock)
+    remove_callback_lock(self.shm, callback_lock)   --释放callback_lock锁
     return
   end
 
   for _, target in ipairs(targets) do
+    -- tgt为self.targets中的对象
     local tgt = get_target(self, target.ip, target.port, target.hostname)
     local internal_health = tgt and tgt.internal_health or nil
+    -- 只将需要检查的模式与当前target状态相同的target加入到待检查的列表中。
+    -- 如当要执行的是健康的节点，只将处于健康状态的target加入到list_to_check
     if (health_mode == "healthy" and (internal_health == "healthy" or
                                       internal_health == "mostly_healthy"))
     or (health_mode == "unhealthy" and (internal_health == "unhealthy" or
@@ -1275,7 +1308,7 @@ local function checker_callback(self, health_mode)
     end
   end
 
-  if not list_to_check[1] then
+  if not list_to_check[1] then    --没有需要检查的对象，释放锁后返回
     self:log(DEBUG, "checking ", health_mode, " targets: nothing to do")
     remove_callback_lock(self.shm, callback_lock)
   else
@@ -1286,23 +1319,25 @@ local function checker_callback(self, health_mode)
       detached = true,
       expire = function()
         self:log(DEBUG, "checking ", health_mode, " targets: #", #list_to_check)
-        self:active_check_targets(list_to_check)
+        self:active_check_targets(list_to_check)      --执行主动健康检查
         remove_callback_lock(self.shm, callback_lock)
       end,
     })
-    if timer == nil then
+    if timer == nil then    --创建timer失败
       self:log(ERR, "failed to create timer to check ", health_mode)
       remove_callback_lock(self.shm, callback_lock)
     end
   end
 end
 
+---事件处理器，event_name可能为  "clear", "remove", "healthy", "unhealthy","mostly_healthy","mostly_unhealthy"
 -- Event handler callback
 function checker:event_handler(event_name, ip, port, hostname)
 
-  local target_found = get_target(self, ip, port, hostname)
+  local target_found = get_target(self, ip, port, hostname) --只是从本地self.targets中查询到的
 
-  if event_name == self.events.remove then
+  ---1.移除target
+  if event_name == self.events.remove then    --主要操作是从self.targets中移除target
     if target_found then
       -- remove hash part
       self.targets[target_found.ip][target_found.port][target_found.hostname] = nil
@@ -1330,12 +1365,13 @@ function checker:event_handler(event_name, ip, port, hostname)
                       hostname or "", "(", ip, ":", port, ")'")
     end
 
+    ---2.健康状态变更。设置本地target.internal_health
   elseif event_name == self.events.healthy or
          event_name == self.events.mostly_healthy or
          event_name == self.events.unhealthy or
          event_name == self.events.mostly_unhealthy
          then
-    if not target_found then
+    if not target_found then    --如果本地没找到target, 则将target加入到self.targets中
       -- it is a new target, must add it first
       target_found = { ip = ip, port = port, hostname = hostname or ip }
       self.targets[target_found.ip] = self.targets[target_found.ip] or {}
@@ -1351,8 +1387,9 @@ function checker:event_handler(event_name, ip, port, hostname)
                       ")' from '", from == "healthy" or from == "mostly_healthy",
                       "' to '",   to   == "healthy" or to   == "mostly_healthy", "'")
     end
-    target_found.internal_health = event_name
+    target_found.internal_health = event_name   --设置本地target的状态
 
+    --- 3. clear事件，将本地self.targets置空
   elseif event_name == self.events.clear then
     -- clear local cache
     self.targets = {}
@@ -1377,6 +1414,7 @@ end
 
 
 -- Raises an event for a target status change.
+-- 发送时间
 function checker:raise_event(event_name, ip, port, hostname)
   local target = { ip = ip, port = port, hostname = hostname }
   worker_events.post(self.EVENT_SOURCE, event_name, target)
@@ -1387,6 +1425,7 @@ end
 -- The timers will be flagged to exit, but will not exit immediately. Only
 -- after the current timers have expired they will be marked as stopped.
 -- @return `true`
+--- 取消事件监听，停止主动和被动健康检查
 function checker:stop()
   self.checks.active.healthy.active = false
   self.checks.active.unhealthy.active = false
@@ -1398,6 +1437,7 @@ end
 
 --- Start the background health checks.
 -- @return `true`, or `nil + error`.
+-- 当创建新的checker实例是会被调用， 主要操作是注册事件监听
 function checker:start()
   if self.checks.active.healthy.interval > 0 then
     self.checks.active.healthy.active = true
@@ -1432,11 +1472,11 @@ local function fail(ctx, k, msg)
   error(table_concat(ctx, ".") .. ": " .. msg, #ctx + 1)
 end
 
-
+-- 将opts与defaults合并，是一个递归的过程。ctx是上下文，记录了当前的层级，主要用来日志展示{,a, a.b, a.b.c}
 local function fill_in_settings(opts, defaults, ctx)
   ctx = ctx or {}
   local obj = {}
-  for k, default in pairs(defaults) do
+  for k, default in pairs(defaults) do   -- 遍历default
     local v = opts[k]
 
     -- basic type-check of configuration
@@ -1469,7 +1509,7 @@ local function fill_in_settings(opts, defaults, ctx)
   return obj
 end
 
-
+-- 默认的健康检查配置
 local function get_defaults()
   return {
     name = NO_DEFAULT,
@@ -1517,6 +1557,8 @@ local function get_defaults()
   }
 end
 
+
+-- - {500, 501} to {"500"=true,"501"=true}
 local function to_set(tbl, key)
   local set = {}
   for _, item in ipairs(tbl[key]) do
@@ -1582,18 +1624,19 @@ end
 function _M.new(opts)
 
   opts = opts or {}
+  -- "http", "https" or "tcp" (default is "http")
   local active_type = (((opts or EMPTY).checks or EMPTY).active or EMPTY).type
   local passive_type = (((opts or EMPTY).checks or EMPTY).passive or EMPTY).type
 
   -- create a new defaults table within new() as defaults table will be modified by to_set function later
-  local defaults = get_defaults()
-  local self = fill_in_settings(opts, defaults)
+  local defaults = get_defaults()   -- 默认配置
+  local self = fill_in_settings(opts, defaults)   --用户配置与默认配置合并
 
-  load_events_module(self)
+  load_events_module(self)  -- 根据self.events_module选择加载event_module
 
   -- If using deprecated self.type, that takes precedence over
   -- a default value. TODO: remove this in a future version
-  if self.type then
+  if self.type then   -- "http", "https" or "tcp" (default is "http")
     self.checks.active.type = active_type or self.type
     self.checks.passive.type = passive_type or self.type
     check_valid_type("type", self.type)
@@ -1616,6 +1659,7 @@ function _M.new(opts)
   assert(self.name, "required option 'name' is missing")
   assert(self.shm_name, "required option 'shm_name' is missing")
 
+  --验证必须是"http", "https" or "tcp"
   check_valid_type("checks.active.type", self.checks.active.type)
   check_valid_type("checks.passive.type", self.checks.passive.type)
 
@@ -1639,23 +1683,24 @@ function _M.new(opts)
   end
 
   -- other properties
+  -- self.targets存放所有的target.包含list和hash两种格式存储的target
   self.targets = nil     -- list of targets, initially loaded, maintained by events
   self.events = nil      -- hash table with supported events (prevent magic strings)
   self.ev_callback = nil -- callback closure per checker instance
 
   -- Convert status lists to sets
-  to_set(self.checks.active.unhealthy, "http_statuses")
+  to_set(self.checks.active.unhealthy, "http_statuses") -- {500, 501} to {"500"=true,"501"=true}
   to_set(self.checks.active.healthy, "http_statuses")
   to_set(self.checks.passive.unhealthy, "http_statuses")
   to_set(self.checks.passive.healthy, "http_statuses")
 
   -- decorate with methods and constants
   self.events = EVENTS
-  for k,v in pairs(checker) do
+  for k,v in pairs(checker) do  --将checker模块相关方法添加到self中
     self[k] = v
   end
 
-  -- prepare shm keys
+  -- prepare shm keys SHM_PREFIX = "lua-resty-healthcheck:"
   self.TARGET_STATE     = SHM_PREFIX .. self.name .. ":state"
   self.TARGET_COUNTER   = SHM_PREFIX .. self.name .. ":counter"
   self.TARGET_LIST      = SHM_PREFIX .. self.name .. ":target_list"
@@ -1664,21 +1709,26 @@ function _M.new(opts)
   self.PERIODIC_LOCK    = SHM_PREFIX .. ":period_lock:"
   self.CALLBACK_LOCK    = SHM_PREFIX .. self.name .. ":callback_lock:"
   -- prepare constants
+  -- local EVENT_SOURCE_PREFIX = "lua-resty-healthcheck"
   self.EVENT_SOURCE     = EVENT_SOURCE_PREFIX .. " [" .. self.name .. "]"
+  -- local LOG_PREFIX = "[healthcheck] "
   self.LOG_PREFIX       = LOG_PREFIX .. "(" .. self.name .. ") "
 
   -- register for events, and directly after load initial target list
   -- order is important!
   do
     -- Lock the list, in case it is being cleared by another worker
+    --对TARGET_LIST_LOCK枷锁，从共享内存中获取target_list，并执行。
+    --由于run_locked在不支持阻塞的上下文中可能会调度到timer中执行，所以这个方法可能是异步执行的。
     local ok, err = locking_target_list(self, function(target_list)
 
-      self.targets = target_list
+      self.targets = target_list  -- 从共享内存中获取target_list
       self:log(DEBUG, "Got initial target list (", #self.targets, " targets)")
 
       -- load individual statuses
-      for _, target in ipairs(self.targets) do
+      for _, target in ipairs(self.targets) do  --为每个target初始化状态，构建self.targets索引
         local state_key = key_for(self.TARGET_STATE, target.ip, target.port, target.hostname)
+        -- internal_health 可能为 "healthy","unhealthy","mostly_healthy","mostly_unhealthy"
         target.internal_health = INTERNAL_STATES[self.shm:get(state_key)]
         self:log(DEBUG, "Got initial status ", target.internal_health, " ",
                         target.hostname, " ", target.ip, ":", target.port)
@@ -1690,12 +1740,13 @@ function _M.new(opts)
 
       return true
     end)
-    if not ok then
+    if not ok then  -- ok可能为"ok" 或 "scheduled"
       -- locking failed, we don't protect `targets` of being nil in other places
       -- so consider this as not recoverable
       return nil, "Error loading initial target list: " .. err
     end
 
+    --事件回调，事件类型可能为  "clear", "remove", "healthy", "unhealthy","mostly_healthy","mostly_unhealthy"
     self.ev_callback = function(data, event)
       -- just a wrapper to be able to access `self` as a closure
       return self:event_handler(event, data.ip, data.port, data.hostname)
@@ -1706,6 +1757,8 @@ function _M.new(opts)
   end
 
   -- turn on active health check
+  -- --主要操作是注册事件监听
+  -- worker_events.register_weak(self.ev_callback, self.EVENT_SOURCE)
   local ok, err = self:start()
   if not ok then
     self:stop()
@@ -1713,6 +1766,7 @@ function _M.new(opts)
   end
 
   -- if active checker is not running, start it
+  -- 一个worker内只会在第一个checker被创建时执行
   if active_check_timer == nil then
 
     self:log(DEBUG, "worker ", ngx_worker_id(), " (pid: ", ngx_worker_pid(), ") ",
@@ -1721,31 +1775,39 @@ function _M.new(opts)
     last_cleanup_check = ngx_now()
     active_check_timer, err = resty_timer({
       recurring = true,
-      interval = CHECK_INTERVAL,
-      jitter = CHECK_JITTER,
+      interval = CHECK_INTERVAL, -- 0.1s    每0.1s执行一次
+      jitter = CHECK_JITTER,  -- CHECK_INTERVAL * 0.1
       detached = false,
       expire = function()
 
-        if get_periodic_lock(shm, key) then
+        -- worker间尝试竞争key锁，获取到锁后继续执行，否则过段时间再尝试
+        -- 注意: 获取到锁后才会执行健康检查，这保证了多个worker即使创建多个健康检查实例，也只会有一个worker在执行健康检查
+        if get_periodic_lock(shm, key) then   --worker间尝试竞争key锁，返回是否成功获取到锁。锁定时间为1.5s
           active_check_timer.interval = CHECK_INTERVAL
-          renew_periodic_lock(shm, key)
+          renew_periodic_lock(shm, key) --重设锁定时间为1.5s
         else
-          active_check_timer.interval = CHECK_INTERVAL * 10
+          active_check_timer.interval = CHECK_INTERVAL * 10 --未获取到锁，1s后再尝试
           return
         end
-
+        ---0.以下主要做两件事，一个是清理被标记清除的target；一个是执行主动健康检查
         local cur_time = ngx_now()
         local is_checked = false
-        for _, checker_obj in pairs(hcs) do
+        for _, checker_obj in pairs(hcs) do   --遍历所有的checker实例
 
-          if (last_cleanup_check + CLEANUP_INTERVAL) < cur_time then
+          ---1.清理hc中被标记需要清理的target.
+          -- CLEANUP_INTERVAL=2.5s
+          if (last_cleanup_check + CLEANUP_INTERVAL) < cur_time then --距离上次cleanup_check已经超过CLEANUP_INTERVAL了
             -- clear targets marked for delayed removal
+            -- 检查每个target的purge_time， 如果不为空且<= cur_time, 则将其添加到removed_targets中
+            -- 并从target_list中移除。同时更新target_list到共享内存中，触发target.remove事件
             locking_target_list(checker_obj, function(target_list)
               is_checked = true
               local removed_targets = {}
               local index = 1
               while index <= #target_list do
                 local target = target_list[index]
+                -- 如果不为空且<= cur_time, 则将其添加到removed_targets中
+                -- 并从target_list中移除
                 if target.purge_time and target.purge_time <= cur_time then
                   table_insert(removed_targets, target)
                   table_remove(target_list, index)
@@ -1754,6 +1816,8 @@ function _M.new(opts)
                 end
               end
 
+              -- 如果有需要移除的target, 1.将新的target_list更新至共享内存；2.清理target在共享内存中的状态数据;
+              -- 3.触发target.remove 时间
               if #removed_targets > 0 then
                 target_list = serialize(target_list)
 
@@ -1770,6 +1834,8 @@ function _M.new(opts)
             end)
           end
 
+          --- 2. 执行健康检查,包括(active.healthy/active.unhealthy)
+          -- 1.判断是否需要执行该hc的healthy状态的targets的主动健康检查
           if checker_obj.checks.active.healthy.active and
             (checker_obj.checks.active.healthy.last_run +
               checker_obj.checks.active.healthy.interval <= cur_time)
@@ -1778,6 +1844,7 @@ function _M.new(opts)
             checker_callback(checker_obj, "healthy")
           end
 
+          --2.判断是否需要执行该hc的unhealthy状态的targets的主动健康检查
           if checker_obj.checks.active.unhealthy.active and
             (checker_obj.checks.active.unhealthy.last_run +
               checker_obj.checks.active.unhealthy.interval <= cur_time)
@@ -1787,16 +1854,18 @@ function _M.new(opts)
           end
         end
 
-        if is_checked then
+        ---遍历hc结束
+        if is_checked then    --只要有hc被清理，就会更新这个值
           last_cleanup_check = cur_time
         end
       end,
     })
-    if not active_check_timer then
+    if not active_check_timer then    --如果启动timer失败,
       self:log(ERR, "Could not start active check timer: ", err)
     end
   end
 
+  -- 将当前实例加入到hcs中。有timer会遍历hcs执行定时操作
   table.insert(hcs, self)
 
   -- TODO: push entire config in debug level logs
